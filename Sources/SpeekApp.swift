@@ -21,14 +21,22 @@ struct SpeekApp: App {
     }
 }
 
+// MARK: - Global Hotkey Handler (Carbon)
+private var globalHotkeyCallback: AppDelegate?
+
+private func carbonHotkeyHandler(nextHandler: EventHandlerCallRef?, event: EventRef?, userData: UnsafeMutableRawPointer?) -> OSStatus {
+    globalHotkeyCallback?.toggleStreaming()
+    return noErr
+}
+
 // MARK: - App Delegate (Menu Bar)
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var statusItem: NSStatusItem!
     var speekState = SpeekState()
     var transcriber: Transcriber!
     var streamingTranscriber: StreamingTranscriber!
-    var globalMonitor: Any?
-    var localMonitor: Any?
+    var hotkeyRef: EventHotKeyRef?
+    var eventHandler: EventHandlerRef?
 
     // Text-based deduplication for typing
     var totalTypedText = ""
@@ -117,18 +125,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         updateMenu()
     }
 
+    var settingsWindow: NSWindow?
+
     func updateMenu() {
         let menu = NSMenu()
+        let hotkeyDisplay = HotkeySettings.shared.displayString
 
         // Streaming status
         if speekState.isStreaming {
-            let item = NSMenuItem(title: "⏹ Stop (⌘⇧S)", action: #selector(toggleStreaming), keyEquivalent: "")
+            let item = NSMenuItem(title: "⏹ Stop (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
             menu.addItem(item)
         } else if speekState.isDownloading {
             let progress = Int(speekState.downloadProgress * 100)
             menu.addItem(NSMenuItem(title: "Downloading model... \(progress)%", action: nil, keyEquivalent: ""))
         } else {
-            let streamItem = NSMenuItem(title: "▶ Start (⌘⇧S)", action: #selector(toggleStreaming), keyEquivalent: "")
+            let streamItem = NSMenuItem(title: "▶ Start (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
             menu.addItem(streamItem)
         }
 
@@ -147,38 +158,101 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Settings
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
+
+        menu.addItem(NSMenuItem.separator())
+
         // Quit
         menu.addItem(NSMenuItem(title: "Quit Speek", action: #selector(quitApp), keyEquivalent: "q"))
 
         statusItem.menu = menu
     }
 
-    func setupGlobalHotkeys() {
-        // Monitor for global key events (Cmd+Shift+S)
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyEvent(event)
+    @objc func openSettings() {
+        if settingsWindow == nil {
+            let settingsView = SettingsView()
+                .environmentObject(speekState)
+            settingsWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 350, height: 300),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            settingsWindow?.title = "Speek Settings"
+            settingsWindow?.contentView = NSHostingView(rootView: settingsView)
+            settingsWindow?.center()
+            settingsWindow?.isReleasedWhenClosed = false
         }
-
-        // Also monitor local events when app is focused
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyEvent(event)
-            return event
-        }
-
-        logger.info("Global hotkey registered: ⌘⇧S (stream)")
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    func handleKeyEvent(_ event: NSEvent) {
-        // Check for Cmd+Shift modifier
-        guard event.modifierFlags.contains([.command, .shift]) else { return }
+    func setupGlobalHotkeys() {
+        globalHotkeyCallback = self
+        registerHotkey()
 
-        switch event.keyCode {
-        case 1: // S key
-            DispatchQueue.main.async { [weak self] in
-                self?.toggleStreaming()
-            }
-        default:
-            break
+        // Observe hotkey changes to re-register
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hotkeyDidChange),
+            name: NSNotification.Name("HotkeyDidChange"),
+            object: nil
+        )
+    }
+
+    @objc func hotkeyDidChange() {
+        unregisterHotkey()
+        registerHotkey()
+        updateMenu()
+    }
+
+    func registerHotkey() {
+        let settings = HotkeySettings.shared
+
+        // Convert NSEvent modifier flags to Carbon modifiers
+        var carbonModifiers: UInt32 = 0
+        let flags = NSEvent.ModifierFlags(rawValue: settings.modifiers)
+        if flags.contains(.command) { carbonModifiers |= UInt32(cmdKey) }
+        if flags.contains(.option) { carbonModifiers |= UInt32(optionKey) }
+        if flags.contains(.control) { carbonModifiers |= UInt32(controlKey) }
+        if flags.contains(.shift) { carbonModifiers |= UInt32(shiftKey) }
+
+        // Register event handler if not already registered
+        if eventHandler == nil {
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(
+                GetApplicationEventTarget(),
+                carbonHotkeyHandler,
+                1,
+                &eventType,
+                nil,
+                &eventHandler
+            )
+        }
+
+        // Register the hotkey
+        let hotkeyID = EventHotKeyID(signature: OSType(0x5350454B), id: 1) // "SPEK"
+        let status = RegisterEventHotKey(
+            UInt32(settings.keyCode),
+            carbonModifiers,
+            hotkeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotkeyRef
+        )
+
+        if status == noErr {
+            logger.info("Global hotkey registered: \(settings.displayString)")
+        } else {
+            logger.error("Failed to register hotkey: \(status)")
+        }
+    }
+
+    func unregisterHotkey() {
+        if let ref = hotkeyRef {
+            UnregisterEventHotKey(ref)
+            hotkeyRef = nil
         }
     }
 
@@ -351,14 +425,79 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     @objc func quitApp() {
-        // Cleanup monitors
-        if let monitor = globalMonitor {
-            NSEvent.removeMonitor(monitor)
+        // Cleanup hotkey
+        unregisterHotkey()
+        if let handler = eventHandler {
+            RemoveEventHandler(handler)
+            eventHandler = nil
         }
-        if let monitor = localMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
+        globalHotkeyCallback = nil
         NSApplication.shared.terminate(nil)
+    }
+}
+
+// MARK: - Hotkey Settings
+class HotkeySettings: ObservableObject {
+    static let shared = HotkeySettings()
+
+    // Default: Cmd+Shift+A (keyCode 0 = A)
+    static let defaultKeyCode: UInt16 = 0
+    static let defaultModifiers: UInt = NSEvent.ModifierFlags.command.rawValue | NSEvent.ModifierFlags.shift.rawValue
+
+    @Published var keyCode: UInt16 {
+        didSet {
+            UserDefaults.standard.set(Int(keyCode), forKey: "hotkeyKeyCode")
+            NotificationCenter.default.post(name: NSNotification.Name("HotkeyDidChange"), object: nil)
+        }
+    }
+    @Published var modifiers: UInt {
+        didSet {
+            UserDefaults.standard.set(Int(modifiers), forKey: "hotkeyModifiers")
+            NotificationCenter.default.post(name: NSNotification.Name("HotkeyDidChange"), object: nil)
+        }
+    }
+
+    init() {
+        if UserDefaults.standard.object(forKey: "hotkeyKeyCode") != nil {
+            self.keyCode = UInt16(UserDefaults.standard.integer(forKey: "hotkeyKeyCode"))
+            self.modifiers = UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))
+        } else {
+            self.keyCode = HotkeySettings.defaultKeyCode
+            self.modifiers = HotkeySettings.defaultModifiers
+        }
+    }
+
+    func reset() {
+        keyCode = HotkeySettings.defaultKeyCode
+        modifiers = HotkeySettings.defaultModifiers
+    }
+
+    var displayString: String {
+        var parts: [String] = []
+        let flags = NSEvent.ModifierFlags(rawValue: modifiers)
+        if flags.contains(.control) { parts.append("⌃") }
+        if flags.contains(.option) { parts.append("⌥") }
+        if flags.contains(.shift) { parts.append("⇧") }
+        if flags.contains(.command) { parts.append("⌘") }
+        parts.append(keyCodeToString(keyCode))
+        return parts.joined()
+    }
+
+    private func keyCodeToString(_ keyCode: UInt16) -> String {
+        let keyMap: [UInt16: String] = [
+            0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X",
+            8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R",
+            16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
+            23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+            30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 37: "L",
+            38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/",
+            45: "N", 46: "M", 47: ".", 49: "Space", 50: "`",
+            36: "↩", 48: "⇥", 51: "⌫", 53: "⎋",
+            122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
+            98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12",
+            123: "←", 124: "→", 125: "↓", 126: "↑"
+        ]
+        return keyMap[keyCode] ?? "?"
     }
 }
 
@@ -373,19 +512,84 @@ class SpeekState: ObservableObject {
     @Published var statusMessage = ""
 }
 
+// MARK: - Hotkey Recorder View
+struct HotkeyRecorderView: View {
+    @ObservedObject var hotkeySettings: HotkeySettings
+    @State private var isRecording = false
+    @State private var localMonitor: Any?
+
+    var body: some View {
+        HStack {
+            Text("Toggle streaming:")
+            Spacer()
+            Button(action: { startRecording() }) {
+                Text(isRecording ? "Press keys..." : hotkeySettings.displayString)
+                    .frame(minWidth: 80)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+            }
+            .buttonStyle(.bordered)
+            .foregroundColor(isRecording ? .orange : .primary)
+        }
+    }
+
+    private func startRecording() {
+        isRecording = true
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleRecordedKey(event)
+            return nil  // Consume the event
+        }
+    }
+
+    private func handleRecordedKey(_ event: NSEvent) {
+        // Require at least one modifier (Cmd, Option, Control, or Shift)
+        let requiredModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        let hasModifier = !event.modifierFlags.intersection(requiredModifiers).isEmpty
+
+        // Escape cancels recording
+        if event.keyCode == 53 {
+            stopRecording()
+            return
+        }
+
+        if hasModifier {
+            // Save the new hotkey
+            let modifierMask: UInt = event.modifierFlags.intersection([.command, .option, .control, .shift]).rawValue
+            hotkeySettings.keyCode = event.keyCode
+            hotkeySettings.modifiers = modifierMask
+        }
+
+        stopRecording()
+    }
+
+    private func stopRecording() {
+        isRecording = false
+        if let monitor = localMonitor {
+            NSEvent.removeMonitor(monitor)
+            localMonitor = nil
+        }
+    }
+}
+
 // MARK: - Settings View
 struct SettingsView: View {
     @EnvironmentObject var state: SpeekState
+    @ObservedObject var hotkeySettings = HotkeySettings.shared
 
     var body: some View {
         Form {
             Section("Keyboard Shortcut") {
-                HStack {
-                    Text("Toggle streaming:")
-                    Spacer()
-                    Text("⌘⇧S")
-                        .foregroundColor(.secondary)
+                HotkeyRecorderView(hotkeySettings: hotkeySettings)
+
+                Text("Click the button and press your desired key combination")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Button("Reset to Default (⌘⇧A)") {
+                    hotkeySettings.reset()
                 }
+                .buttonStyle(.borderless)
+                .foregroundColor(.accentColor)
             }
 
             Section("Model") {
@@ -412,7 +616,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 350, height: 250)
+        .frame(width: 350, height: 300)
     }
 }
 

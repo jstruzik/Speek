@@ -108,16 +108,42 @@ actor StreamingTranscriber {
         lastSentText = ""
     }
 
+    /// Filter out WhisperKit special tokens and markers
+    private func filterSpecialTokens(_ text: String) -> String {
+        var filtered = text
+        // Remove common WhisperKit special markers
+        let specialPatterns = [
+            "\\[\\[BLANK_AUDIO\\]\\]",
+            "\\[BLANK_AUDIO\\]",
+            "\\(blank audio\\)",
+            "\\[inaudible\\]",
+            "\\[silence\\]"
+        ]
+        for pattern in specialPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                filtered = regex.stringByReplacingMatches(
+                    in: filtered,
+                    range: NSRange(filtered.startIndex..., in: filtered),
+                    withTemplate: ""
+                )
+            }
+        }
+        // Clean up extra whitespace
+        filtered = filtered.replacingOccurrences(of: "  ", with: " ")
+        return filtered.trimmingCharacters(in: .whitespaces)
+    }
+
     /// Handle state changes from AudioStreamTranscriber
     private func handleStateChange(oldState: AudioStreamTranscriber.State, newState: AudioStreamTranscriber.State) {
         // Build current full text from confirmed + unconfirmed segments
         var currentText = newState.confirmedSegments
-            .map { $0.text.trimmingCharacters(in: .whitespaces) }
+            .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.isEmpty }
             .joined(separator: " ")
 
         // Include unconfirmed segments for realtime output
         for segment in newState.unconfirmedSegments {
-            let text = segment.text.trimmingCharacters(in: .whitespaces)
+            let text = filterSpecialTokens(segment.text.trimmingCharacters(in: .whitespaces))
             if !text.isEmpty {
                 if !currentText.isEmpty {
                     currentText += " "
