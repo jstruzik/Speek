@@ -40,6 +40,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // Text-based deduplication for typing
     var totalTypedText = ""
+    var isTyping = false
+    var pendingText: String?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false  // Keep running as menu bar app
@@ -274,6 +276,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         speekState.isStreaming = true
         speekState.streamedText = ""
         totalTypedText = ""
+        isTyping = false
+        pendingText = nil
         updateMenuBarIcon(streaming: true)
         updateMenu()
 
@@ -301,6 +305,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     /// Handle full text update from StreamingTranscriber - calculate diff and apply
     func onFullTextUpdate(_ targetText: String) {
+        // Prevent overlapping updates - store pending and process after current finishes
+        if isTyping {
+            pendingText = targetText
+            return
+        }
+
+        isTyping = true
+        defer {
+            isTyping = false
+            // Process any pending update that arrived while typing
+            if let pending = pendingText {
+                pendingText = nil
+                onFullTextUpdate(pending)
+            }
+        }
+
         // Calculate diff between what we've typed and what we should have
         let (backspaceCount, newText) = calculateDiff(from: totalTypedText, to: targetText)
 

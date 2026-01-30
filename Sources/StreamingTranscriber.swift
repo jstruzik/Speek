@@ -18,9 +18,14 @@ actor StreamingTranscriber {
     // Track last sent text to avoid duplicate callbacks
     private var lastSentText = ""
 
+    // Rolling window: text that's been locked in and won't be revised
+    private var lockedText = ""
+    private var lockedSegmentCount = 0
+
     // Configuration
     private let silenceThreshold: Float = 0.2  // Lower = more sensitive to voice
-    private let requiredSegmentsForConfirmation: Int = 1
+    private let requiredSegmentsForConfirmation: Int = 2  // Higher = better word boundaries, more latency
+    private let segmentsToKeepRevisable: Int = 3  // Keep last N confirmed segments revisable
 
     init() {}
 
@@ -48,6 +53,8 @@ actor StreamingTranscriber {
 
         // Reset state
         lastSentText = ""
+        lockedText = ""
+        lockedSegmentCount = 0
 
         // Get tokenizer (already loaded by WhisperKit)
         guard let tokenizer = whisperKit.tokenizer else {
@@ -106,18 +113,37 @@ actor StreamingTranscriber {
         audioStreamTranscriber = nil
         onFullTextChange = nil
         lastSentText = ""
+        lockedText = ""
+        lockedSegmentCount = 0
     }
 
     /// Filter out WhisperKit special tokens and markers
     private func filterSpecialTokens(_ text: String) -> String {
         var filtered = text
-        // Remove common WhisperKit special markers
+        // Remove common WhisperKit special markers and non-speech sounds
         let specialPatterns = [
+            // Blank audio markers (various formats)
             "\\[\\[BLANK_AUDIO\\]\\]",
             "\\[BLANK_AUDIO\\]",
             "\\(blank audio\\)",
-            "\\[inaudible\\]",
-            "\\[silence\\]"
+            "BLANK_AUDIO",
+            "BLANK AUDIO",
+            "\\bBLANK\\b",
+            // Speech quality markers (various spacing formats)
+            "\\[\\s*inaudible\\s*\\]",
+            "\\[\\s*silence\\s*\\]",
+            "\\[\\s*unintelligible\\s*\\]",
+            "\\(\\s*silence\\s*\\)",
+            // Non-speech sounds in brackets [clicking], [typing], [music], etc.
+            "\\[[^\\]]*(?:click|type|typing|keyboard|music|applause|laughter|cough|sneeze|noise|sound|static|background|breathing)s?[^\\]]*\\]",
+            // Non-speech sounds in asterisks *clicking*, *typing*, etc.
+            "\\*[^*]*(?:click|type|typing|keyboard|cough|sneeze|sigh|laugh|noise|sound|breathing)s?[^*]*\\*",
+            // Non-speech sounds in parentheses (clicking), (typing), etc.
+            "\\([^)]*(?:click|type|typing|keyboard|cough|sneeze|sigh|laugh|noise|sound|breathing)s?[^)]*\\)",
+            // Whisper hallucinations
+            "thank(?:s| you) for (?:watching|listening)",
+            "(?:please )?(?:like and )?subscribe",
+            "see you (?:next time|in the next)"
         ]
         for pattern in specialPatterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
@@ -130,13 +156,76 @@ actor StreamingTranscriber {
         }
         // Clean up extra whitespace
         filtered = filtered.replacingOccurrences(of: "  ", with: " ")
-        return filtered.trimmingCharacters(in: .whitespaces)
+        filtered = filtered.trimmingCharacters(in: .whitespaces)
+
+        // Filter out text that's just punctuation or non-word sounds
+        // (keyboard clicks often transcribe as ".", "..", "tick", "tock", single letters)
+        let stripped = filtered.lowercased().filter { $0.isLetter }
+
+        // Allow common short words, filter everything else under 2 letters
+        let validShortWords = Set(["i", "a", "o", "oh", "ah", "ok", "no", "so", "go", "do", "to", "be", "he", "we", "me", "my", "by", "up", "or", "on", "in", "an", "at", "as", "is", "it", "if"])
+        if stripped.count < 2 && !validShortWords.contains(stripped) {
+            return ""
+        }
+
+        // Filter common click/noise transcriptions
+        let noiseWords = Set(["tick", "tock", "click", "clack", "tap", "tic", "tik", "tak", "pop", "beep", "ding", "thud", "thump", "bang", "blank"])
+        if noiseWords.contains(stripped) {
+            return ""
+        }
+
+        // Fix common word concatenation issues from Whisper
+        // Only split on words unlikely to be suffixes of real English words
+        // e.g., "meanit" -> "mean it", but "exit" stays "exit"
+        let safeSplitWords = [
+            "seems", "would", "could", "should", "think", "because", "concatenate", "concatenates",
+            "actually", "really", "probably", "definitely", "something", "everything", "nothing",
+            "always", "never", "maybe", "pretty", "very", "just", "still", "also", "even",
+            "only", "well", "much", "more", "most", "some", "many", "such", "like"
+        ]
+        var result = filtered
+        for word in safeSplitWords {
+            // Match word concatenated after a letter (e.g., "itseems" -> "it seems")
+            let pattern = "([a-zA-Z])(\(word))\\b"
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: "$1 $2"
+                )
+            }
+        }
+
+        return result
     }
 
     /// Handle state changes from AudioStreamTranscriber
     private func handleStateChange(oldState: AudioStreamTranscriber.State, newState: AudioStreamTranscriber.State) {
-        // Build current full text from confirmed + unconfirmed segments
-        var currentText = newState.confirmedSegments
+        let confirmedCount = newState.confirmedSegments.count
+
+        // Lock in older segments that are beyond our revisable window
+        // This prevents revisions to text from long ago
+        if confirmedCount > lockedSegmentCount + segmentsToKeepRevisable {
+            let segmentsToLock = confirmedCount - segmentsToKeepRevisable
+            let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<segmentsToLock]
+            let newLockedText = newLockedSegments
+                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+
+            if !newLockedText.isEmpty {
+                if !lockedText.isEmpty {
+                    lockedText += " "
+                }
+                lockedText += newLockedText
+            }
+            lockedSegmentCount = segmentsToLock
+            logger.info("Locked \(segmentsToLock) segments, locked text now: '\(self.lockedText.suffix(50))...'")
+        }
+
+        // Build revisable text from recent confirmed segments + unconfirmed
+        let revisableSegments = Array(newState.confirmedSegments.suffix(from: lockedSegmentCount))
+        var revisableText = revisableSegments
             .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
@@ -145,13 +234,21 @@ actor StreamingTranscriber {
         for segment in newState.unconfirmedSegments {
             let text = filterSpecialTokens(segment.text.trimmingCharacters(in: .whitespaces))
             if !text.isEmpty {
-                if !currentText.isEmpty {
-                    currentText += " "
+                if !revisableText.isEmpty {
+                    revisableText += " "
                 }
-                currentText += text
+                revisableText += text
             }
         }
 
+        // Combine locked + revisable for full text
+        var currentText = lockedText
+        if !revisableText.isEmpty {
+            if !currentText.isEmpty {
+                currentText += " "
+            }
+            currentText += revisableText
+        }
         currentText = currentText.trimmingCharacters(in: .whitespaces)
 
         // Skip if nothing changed
