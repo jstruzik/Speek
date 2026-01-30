@@ -21,11 +21,13 @@ actor StreamingTranscriber {
     // Rolling window: text that's been locked in and won't be revised
     private var lockedText = ""
     private var lockedSegmentCount = 0
+    private var lastTextChangeTime = Date()
 
     // Configuration
     private let silenceThreshold: Float = 0.2  // Lower = more sensitive to voice
     private let requiredSegmentsForConfirmation: Int = 2  // Higher = better word boundaries, more latency
     private let segmentsToKeepRevisable: Int = 3  // Keep last N confirmed segments revisable
+    private let silenceLockDelay: TimeInterval = 2.0  // Lock all segments after N seconds of no changes
 
     init() {}
 
@@ -55,6 +57,7 @@ actor StreamingTranscriber {
         lastSentText = ""
         lockedText = ""
         lockedSegmentCount = 0
+        lastTextChangeTime = Date()
 
         // Get tokenizer (already loaded by WhisperKit)
         guard let tokenizer = whisperKit.tokenizer else {
@@ -202,6 +205,27 @@ actor StreamingTranscriber {
     /// Handle state changes from AudioStreamTranscriber
     private func handleStateChange(oldState: AudioStreamTranscriber.State, newState: AudioStreamTranscriber.State) {
         let confirmedCount = newState.confirmedSegments.count
+        let now = Date()
+
+        // Time-based locking: if no text changes for a while, lock all confirmed segments
+        // This prevents corrections after a pause in speech
+        let timeSinceLastChange = now.timeIntervalSince(lastTextChangeTime)
+        if timeSinceLastChange > silenceLockDelay && confirmedCount > lockedSegmentCount {
+            let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<confirmedCount]
+            let newLockedText = newLockedSegments
+                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+
+            if !newLockedText.isEmpty {
+                if !lockedText.isEmpty {
+                    lockedText += " "
+                }
+                lockedText += newLockedText
+            }
+            lockedSegmentCount = confirmedCount
+            logger.info("Time-based lock: locked all \(confirmedCount) segments after \(String(format: "%.1f", timeSinceLastChange))s silence")
+        }
 
         // Lock in older segments that are beyond our revisable window
         // This prevents revisions to text from long ago
@@ -256,6 +280,8 @@ actor StreamingTranscriber {
             return
         }
 
+        // Text changed - update timestamp for time-based locking
+        lastTextChangeTime = now
         lastSentText = currentText
         logger.info("Current text: '\(currentText)'")
 
