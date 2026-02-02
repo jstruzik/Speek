@@ -207,6 +207,14 @@ actor StreamingTranscriber {
         let confirmedCount = newState.confirmedSegments.count
         let now = Date()
 
+        // Safety check: WhisperKit can revise and reduce segment count
+        // If our locked count is now invalid, reset it
+        if lockedSegmentCount > confirmedCount {
+            logger.warning("Segment count reduced from \(self.lockedSegmentCount) to \(confirmedCount), resetting lock")
+            lockedSegmentCount = 0
+            // Keep locked text as-is since it's already been typed
+        }
+
         // Time-based locking: if no text changes for a while, lock all confirmed segments
         // This prevents corrections after a pause in speech
         let timeSinceLastChange = now.timeIntervalSince(lastTextChangeTime)
@@ -231,24 +239,28 @@ actor StreamingTranscriber {
         // This prevents revisions to text from long ago
         if confirmedCount > lockedSegmentCount + segmentsToKeepRevisable {
             let segmentsToLock = confirmedCount - segmentsToKeepRevisable
-            let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<segmentsToLock]
-            let newLockedText = newLockedSegments
-                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
+            // Ensure valid range
+            if segmentsToLock > lockedSegmentCount {
+                let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<segmentsToLock]
+                let newLockedText = newLockedSegments
+                    .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
 
-            if !newLockedText.isEmpty {
-                if !lockedText.isEmpty {
-                    lockedText += " "
+                if !newLockedText.isEmpty {
+                    if !lockedText.isEmpty {
+                        lockedText += " "
+                    }
+                    lockedText += newLockedText
                 }
-                lockedText += newLockedText
+                lockedSegmentCount = segmentsToLock
+                logger.info("Locked \(segmentsToLock) segments, locked text now: '\(self.lockedText.suffix(50))...'")
             }
-            lockedSegmentCount = segmentsToLock
-            logger.info("Locked \(segmentsToLock) segments, locked text now: '\(self.lockedText.suffix(50))...'")
         }
 
         // Build revisable text from recent confirmed segments + unconfirmed
-        let revisableSegments = Array(newState.confirmedSegments.suffix(from: lockedSegmentCount))
+        let safeStartIndex = min(lockedSegmentCount, confirmedCount)
+        let revisableSegments = Array(newState.confirmedSegments.suffix(from: safeStartIndex))
         var revisableText = revisableSegments
             .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
             .filter { !$0.isEmpty }

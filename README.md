@@ -2,6 +2,8 @@
 
 A lightweight macOS menu bar app for real-time speech-to-text using [WhisperKit](https://github.com/argmaxinc/WhisperKit). Speek transcribes your speech and types it directly into any application.
 
+https://github.com/user-attachments/assets/06180615-f644-4879-be17-d08a26f095a1
+
 ## Features
 
 - **Real-time transcription** - Text appears as you speak with live corrections
