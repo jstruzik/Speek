@@ -52,9 +52,9 @@ swift build -c release
 2. **Grant Permissions**:
    - **Microphone**: Required for audio capture
    - **Accessibility**: Required for typing text into other applications
-3. **Start Transcribing**: Click the menu bar icon or press `Cmd+Shift+S`
+3. **Start Transcribing**: Click the menu bar icon or press (Default is `Cmd+Shift+A`, this is configurable)
 4. **Speak**: Your speech will be transcribed and typed in real-time
-5. **Stop**: Press `Cmd+Shift+S` again to stop
+5. **Stop**: Press `Cmd+Shift+A` again to stop
 
 ## Permissions
 
