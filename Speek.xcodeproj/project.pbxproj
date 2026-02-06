@@ -12,6 +12,7 @@
 		003 /* Transcriber.swift in Sources */ = {isa = PBXBuildFile; fileRef = 103; };
 		004 /* StreamingTranscriber.swift in Sources */ = {isa = PBXBuildFile; fileRef = 104; };
 		005 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 501; };
+		006 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 107; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -21,6 +22,7 @@
 		104 /* StreamingTranscriber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingTranscriber.swift; sourceTree = "<group>"; };
 		105 /* Speek.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Speek.entitlements; sourceTree = "<group>"; };
 		106 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		107 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		200 /* Speek.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Speek.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -40,6 +42,7 @@
 			isa = PBXGroup;
 			children = (
 				402 /* Sources */,
+				107 /* Assets.xcassets */,
 				105 /* Speek.entitlements */,
 				401 /* Products */,
 			);
@@ -67,6 +70,17 @@
 		};
 /* End PBXGroup section */
 
+/* Begin PBXResourcesBuildPhase section */
+		302 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				006 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXNativeTarget section */
 		600 /* Speek */ = {
 			isa = PBXNativeTarget;
@@ -74,6 +88,7 @@
 			buildPhases = (
 				601 /* Sources */,
 				300 /* Frameworks */,
+				302 /* Resources */,
 			);
 			buildRules = (
 			);
