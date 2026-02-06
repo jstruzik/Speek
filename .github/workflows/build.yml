@@ -28,8 +28,8 @@ jobs:
             -derivedDataPath build \
             -destination 'platform=macOS' \
             CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
             build
 
       - name: Create app bundle
@@ -39,7 +39,11 @@ jobs:
 
       - name: Create DMG
         run: |
-          hdiutil create -volname "Speek" -srcfolder release -ov -format UDZO Speek.dmg
+          mkdir -p dmg-staging
+          cp -R release/Speek.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Speek" -srcfolder dmg-staging -ov -format UDZO Speek.dmg
+          rm -rf dmg-staging
 
       - name: Create ZIP
         run: |
