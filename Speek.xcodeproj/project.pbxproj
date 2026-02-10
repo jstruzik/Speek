@@ -13,6 +13,7 @@
 		004 /* StreamingTranscriber.swift in Sources */ = {isa = PBXBuildFile; fileRef = 104; };
 		005 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 501; };
 		006 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 107; };
+		007 /* AudioDeviceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 108; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +24,7 @@
 		105 /* Speek.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Speek.entitlements; sourceTree = "<group>"; };
 		106 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		107 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		108 /* AudioDeviceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioDeviceManager.swift; sourceTree = "<group>"; };
 		200 /* Speek.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Speek.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -63,6 +65,7 @@
 				102 /* AudioRecorder.swift */,
 				103 /* Transcriber.swift */,
 				104 /* StreamingTranscriber.swift */,
+				108 /* AudioDeviceManager.swift */,
 				106 /* Info.plist */,
 			);
 			path = Sources;
@@ -142,6 +145,7 @@
 				002 /* AudioRecorder.swift in Sources */,
 				003 /* Transcriber.swift in Sources */,
 				004 /* StreamingTranscriber.swift in Sources */,
+				007 /* AudioDeviceManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -157,7 +161,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -185,7 +189,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";

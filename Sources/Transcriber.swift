@@ -7,6 +7,7 @@ private let logger = Logger(subsystem: "com.speek.app", category: "transcriber")
 class Transcriber {
     private var whisperKit: WhisperKit?
     private var state: SpeekState
+    private let audioProcessor = DeviceAwareAudioProcessor()
 
     init(state: SpeekState) {
         self.state = state
@@ -15,6 +16,11 @@ class Transcriber {
     /// Get the WhisperKit instance (for use with StreamingTranscriber)
     func getWhisperKit() -> WhisperKit? {
         return whisperKit
+    }
+
+    /// Get the custom audio processor (for device selection)
+    func getAudioProcessor() -> DeviceAwareAudioProcessor {
+        return audioProcessor
     }
 
     /// Get persistent model storage path in Application Support
@@ -64,6 +70,7 @@ class Transcriber {
             let config = WhisperKitConfig(
                 model: state.modelName,
                 downloadBase: modelPath,
+                audioProcessor: audioProcessor,
                 verbose: true,
                 logLevel: .debug,
                 prewarm: true,

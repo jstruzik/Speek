@@ -1,7 +1,9 @@
 import SwiftUI
 import Carbon.HIToolbox
+import CoreAudio
 import os.log
 import AVFoundation
+import WhisperKit
 
 private let logger = Logger(subsystem: "com.speek.app", category: "main")
 
@@ -37,11 +39,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var streamingTranscriber: StreamingTranscriber!
     var hotkeyRef: EventHotKeyRef?
     var eventHandler: EventHandlerRef?
+    var fnGlobalMonitor: Any?
+    var fnLocalMonitor: Any?
 
-    // Text-based deduplication for typing
-    var totalTypedText = ""
-    var isTyping = false
-    var pendingText: String?
+    // Overlay window for real-time transcription display
+    var overlayWindow: NSPanel?
+    var overlayTextView: NSTextView?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false  // Keep running as menu bar app
@@ -101,12 +104,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
             // Initialize streaming transcriber with the loaded WhisperKit instance
             if let whisperKit = transcriber.getWhisperKit() {
-                await streamingTranscriber.initialize(whisperKit: whisperKit)
+                await streamingTranscriber.initialize(whisperKit: whisperKit, audioProcessor: transcriber.getAudioProcessor())
             }
 
-            // Close progress window after loading (whether download was needed or not)
+            // Close progress window after loading
             await MainActor.run {
-                // Close any windows with "Speek" in the title (the setup window)
                 for window in NSApp.windows {
                     if window.title.contains("Speek") || window.identifier?.rawValue == "progress" {
                         window.close()
@@ -131,17 +133,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func updateMenu() {
         let menu = NSMenu()
-        let hotkeyDisplay = HotkeySettings.shared.displayString
+        let settings = HotkeySettings.shared
+        let hotkeyDisplay = settings.activationMode == .pressAndHold ? "Hold Fn" : settings.displayString
 
         // Streaming status
         if speekState.isStreaming {
-            let item = NSMenuItem(title: "⏹ Stop (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
+            let item = NSMenuItem(title: "Stop (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
             menu.addItem(item)
         } else if speekState.isDownloading {
             let progress = Int(speekState.downloadProgress * 100)
             menu.addItem(NSMenuItem(title: "Downloading model... \(progress)%", action: nil, keyEquivalent: ""))
         } else {
-            let streamItem = NSMenuItem(title: "▶ Start (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
+            let streamItem = NSMenuItem(title: "Start (\(hotkeyDisplay))", action: #selector(toggleStreaming), keyEquivalent: "")
             menu.addItem(streamItem)
         }
 
@@ -153,7 +156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         menu.addItem(modelItem)
 
         if speekState.isModelLoaded {
-            let readyItem = NSMenuItem(title: "✓ Model ready", action: nil, keyEquivalent: "")
+            let readyItem = NSMenuItem(title: "Model ready", action: nil, keyEquivalent: "")
             readyItem.isEnabled = false
             menu.addItem(readyItem)
         }
@@ -176,7 +179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             let settingsView = SettingsView()
                 .environmentObject(speekState)
             settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 350, height: 300),
+                contentRect: NSRect(x: 0, y: 0, width: 350, height: 380),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
@@ -192,7 +195,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func setupGlobalHotkeys() {
         globalHotkeyCallback = self
-        registerHotkey()
+
+        // Set up based on current activation mode
+        if HotkeySettings.shared.activationMode == .toggle {
+            registerHotkey()
+        } else {
+            setupFnKeyMonitor()
+        }
 
         // Observe hotkey changes to re-register
         NotificationCenter.default.addObserver(
@@ -204,9 +213,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     @objc func hotkeyDidChange() {
-        unregisterHotkey()
-        registerHotkey()
+        let mode = HotkeySettings.shared.activationMode
+        if mode == .toggle {
+            teardownFnKeyMonitor()
+            unregisterHotkey()
+            registerHotkey()
+        } else {
+            unregisterHotkey()
+            setupFnKeyMonitor()
+        }
         updateMenu()
+    }
+
+    func setupFnKeyMonitor() {
+        // Tear down any existing monitors first
+        teardownFnKeyMonitor()
+
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            let fnPressed = event.modifierFlags.contains(.function)
+            guard let self = self else { return }
+            if fnPressed && !self.speekState.isStreaming {
+                guard self.speekState.isModelLoaded else {
+                    self.showNotification(title: "Speek", body: "Model is still loading...")
+                    return
+                }
+                self.startStreaming()
+            } else if !fnPressed && self.speekState.isStreaming {
+                self.stopStreaming()
+            }
+        }
+
+        fnGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { event in
+            handler(event)
+        }
+        fnLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+            handler(event)
+            return event
+        }
+    }
+
+    func teardownFnKeyMonitor() {
+        if let monitor = fnGlobalMonitor {
+            NSEvent.removeMonitor(monitor)
+            fnGlobalMonitor = nil
+        }
+        if let monitor = fnLocalMonitor {
+            NSEvent.removeMonitor(monitor)
+            fnLocalMonitor = nil
+        }
     }
 
     func registerHotkey() {
@@ -271,114 +325,115 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
 
+    // MARK: - Overlay Window
+
+    func showOverlay() {
+        if overlayWindow == nil {
+            // Create a floating panel that doesn't activate (steal focus)
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 500, height: 80),
+                styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .hudWindow],
+                backing: .buffered,
+                defer: false
+            )
+            panel.title = "Speek"
+            panel.level = .floating
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+            // Create a scroll view with text view for the transcription
+            let scrollView = NSScrollView(frame: panel.contentView!.bounds)
+            scrollView.autoresizingMask = [.width, .height]
+            scrollView.hasVerticalScroller = true
+            scrollView.borderType = .noBorder
+
+            let textView = NSTextView(frame: scrollView.bounds)
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.backgroundColor = .clear
+            textView.font = NSFont.systemFont(ofSize: 16)
+            textView.textColor = .labelColor
+            textView.textContainerInset = NSSize(width: 12, height: 8)
+            textView.autoresizingMask = [.width, .height]
+            textView.string = "Listening..."
+
+            scrollView.documentView = textView
+            panel.contentView = scrollView
+
+            self.overlayWindow = panel
+            self.overlayTextView = textView
+        }
+
+        // Position near top-center of main screen
+        if let screen = NSScreen.main {
+            let screenFrame = screen.visibleFrame
+            let panelWidth: CGFloat = 500
+            let panelHeight: CGFloat = 80
+            let x = screenFrame.midX - panelWidth / 2
+            let y = screenFrame.maxY - panelHeight - 20
+            overlayWindow?.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
+        }
+
+        overlayTextView?.string = "Listening..."
+        overlayWindow?.orderFront(nil)
+    }
+
+    func updateOverlayText(_ text: String) {
+        overlayTextView?.string = text.isEmpty ? "Listening..." : text
+
+        // Auto-scroll to bottom
+        if let textView = overlayTextView {
+            textView.scrollRangeToVisible(NSRange(location: textView.string.count, length: 0))
+        }
+    }
+
+    func hideOverlay() {
+        overlayWindow?.orderOut(nil)
+    }
+
+    // MARK: - Streaming
+
     func startStreaming() {
-        logger.info("Starting streaming mode")
+        // Check accessibility permission before starting
+        if !AXIsProcessTrusted() {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+            return
+        }
+
         speekState.isStreaming = true
         speekState.streamedText = ""
-        totalTypedText = ""
-        isTyping = false
-        pendingText = nil
         updateMenuBarIcon(streaming: true)
         updateMenu()
 
+        // Show the floating overlay
+        showOverlay()
+
+        // Resolve the input device from settings
+        let inputDeviceID = InputDeviceSettings.shared.resolvedDeviceID()
+
         Task {
             do {
-                try await streamingTranscriber.startStreaming { [weak self] fullText in
-                    // This callback is invoked with the full current transcription
-                    // We handle diffing here to avoid race conditions
+                try await streamingTranscriber.startStreaming(inputDeviceID: inputDeviceID) { [weak self] fullText in
                     DispatchQueue.main.async {
-                        self?.onFullTextUpdate(fullText)
+                        self?.speekState.streamedText = fullText
+                        self?.updateOverlayText(fullText)
                     }
                 }
-                logger.info("Streaming started - speak now!")
             } catch {
                 logger.error("Failed to start streaming: \(error.localizedDescription)")
                 await MainActor.run {
                     self.speekState.isStreaming = false
                     self.updateMenuBarIcon(streaming: false)
                     self.updateMenu()
+                    self.hideOverlay()
                     self.showNotification(title: "Speek", body: "Failed to start: \(error.localizedDescription)")
                 }
             }
-        }
-    }
-
-    /// Handle full text update from StreamingTranscriber - calculate diff and apply
-    func onFullTextUpdate(_ targetText: String) {
-        // Prevent overlapping updates - store pending and process after current finishes
-        if isTyping {
-            pendingText = targetText
-            return
-        }
-
-        isTyping = true
-        defer {
-            isTyping = false
-            // Process any pending update that arrived while typing
-            if let pending = pendingText {
-                pendingText = nil
-                onFullTextUpdate(pending)
-            }
-        }
-
-        // Calculate diff between what we've typed and what we should have
-        let (backspaceCount, newText) = calculateDiff(from: totalTypedText, to: targetText)
-
-        // Apply the diff
-        if backspaceCount > 0 {
-            typeBackspaces(count: backspaceCount)
-            let keepCount = max(0, totalTypedText.count - backspaceCount)
-            totalTypedText = String(totalTypedText.prefix(keepCount))
-        }
-
-        if !newText.isEmpty {
-            typeText(newText)
-            totalTypedText += newText
-        }
-
-        speekState.streamedText = totalTypedText
-    }
-
-    /// Calculate diff between current typed text and target text
-    /// Returns (backspaceCount, textToType)
-    func calculateDiff(from oldText: String, to newText: String) -> (Int, String) {
-        let oldChars = Array(oldText)
-        let newChars = Array(newText)
-
-        // Find common prefix length
-        var commonPrefixLength = 0
-        for i in 0..<min(oldChars.count, newChars.count) {
-            if oldChars[i] == newChars[i] {
-                commonPrefixLength = i + 1
-            } else {
-                break
-            }
-        }
-
-        // Backspaces needed = old chars after common prefix
-        let backspaceCount = oldChars.count - commonPrefixLength
-
-        // New text = new chars after common prefix
-        let textToType = String(newChars[commonPrefixLength...])
-
-        return (backspaceCount, textToType)
-    }
-
-    /// Send backspace key presses to delete characters
-    func typeBackspaces(count: Int) {
-        guard count > 0 else { return }
-
-        let source = CGEventSource(stateID: .hidSystemState)
-        let backspaceKeyCode: CGKeyCode = 51  // macOS backspace key code
-
-        for _ in 0..<count {
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: true)
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: false)
-
-            keyDown?.post(tap: .cghidEventTap)
-            keyUp?.post(tap: .cghidEventTap)
-
-            usleep(3000)  // Small delay for reliability
         }
     }
 
@@ -387,39 +442,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         updateMenuBarIcon(streaming: false)
 
         Task {
+            // Get the final transcribed text before stopping
+            let finalText = await streamingTranscriber.getLastText()
             await streamingTranscriber.stopStreaming()
 
             await MainActor.run {
-                showNotification(title: "Speek", body: "Streaming stopped")
-                updateMenu()
+                self.hideOverlay()
+                self.updateMenu()
+
+                // Paste the final text into the focused app
+                if !finalText.isEmpty {
+                    self.pasteText(finalText)
+                }
             }
         }
     }
 
-    func typeText(_ text: String) {
-        // Check if we have accessibility permission
-        let trusted = AXIsProcessTrusted()
-        if !trusted {
-            logger.error("Accessibility permission not granted! Please enable in System Settings → Privacy & Security → Accessibility")
-            showNotification(title: "Speek", body: "Please grant Accessibility permission in System Settings")
-            return
-        }
+    /// Paste text into the focused application via clipboard + Cmd+V
+    func pasteText(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        let previousContents = pasteboard.string(forType: .string)
 
+        // Put our text on the clipboard
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+
+        // Simulate Cmd+V to paste
         let source = CGEventSource(stateID: .hidSystemState)
+        let vKeyCode: CGKeyCode = 9  // 'V' key
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
+        keyDown?.flags = .maskCommand
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
 
-        for char in text {
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-
-            var chars = [UniChar](String(char).utf16)
-            keyDown?.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
-            keyUp?.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
-
-            keyDown?.post(tap: .cghidEventTap)
-            keyUp?.post(tap: .cghidEventTap)
-
-            // Small delay between characters for reliability
-            usleep(5000)
+        // Brief delay for the paste to complete, then restore clipboard
+        usleep(50000)
+        pasteboard.clearContents()
+        if let previous = previousContents {
+            pasteboard.setString(previous, forType: .string)
         }
     }
 
@@ -445,8 +507,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     @objc func quitApp() {
-        // Cleanup hotkey
+        // Cleanup hotkey and monitors
         unregisterHotkey()
+        teardownFnKeyMonitor()
         if let handler = eventHandler {
             RemoveEventHandler(handler)
             eventHandler = nil
@@ -456,6 +519,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 }
 
+// MARK: - Activation Mode
+enum ActivationMode: String, CaseIterable {
+    case toggle = "toggle"
+    case pressAndHold = "pressAndHold"
+}
+
 // MARK: - Hotkey Settings
 class HotkeySettings: ObservableObject {
     static let shared = HotkeySettings()
@@ -463,6 +532,13 @@ class HotkeySettings: ObservableObject {
     // Default: Cmd+Shift+A (keyCode 0 = A)
     static let defaultKeyCode: UInt16 = 0
     static let defaultModifiers: UInt = NSEvent.ModifierFlags.command.rawValue | NSEvent.ModifierFlags.shift.rawValue
+
+    @Published var activationMode: ActivationMode {
+        didSet {
+            UserDefaults.standard.set(activationMode.rawValue, forKey: "activationMode")
+            NotificationCenter.default.post(name: NSNotification.Name("HotkeyDidChange"), object: nil)
+        }
+    }
 
     @Published var keyCode: UInt16 {
         didSet {
@@ -478,6 +554,13 @@ class HotkeySettings: ObservableObject {
     }
 
     init() {
+        if let modeString = UserDefaults.standard.string(forKey: "activationMode"),
+           let mode = ActivationMode(rawValue: modeString) {
+            self.activationMode = mode
+        } else {
+            self.activationMode = .toggle
+        }
+
         if UserDefaults.standard.object(forKey: "hotkeyKeyCode") != nil {
             self.keyCode = UInt16(UserDefaults.standard.integer(forKey: "hotkeyKeyCode"))
             self.modifiers = UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))
@@ -518,6 +601,45 @@ class HotkeySettings: ObservableObject {
             123: "←", 124: "→", 125: "↓", 126: "↑"
         ]
         return keyMap[keyCode] ?? "?"
+    }
+}
+
+// MARK: - Input Device Settings
+class InputDeviceSettings: ObservableObject {
+    static let shared = InputDeviceSettings()
+
+    /// The UID string of the preferred device (stable across reboots), or nil for "System Default"
+    @Published var preferredDeviceUID: String? {
+        didSet {
+            if let uid = preferredDeviceUID {
+                UserDefaults.standard.set(uid, forKey: "preferredInputDeviceUID")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "preferredInputDeviceUID")
+            }
+        }
+    }
+
+    /// Available input devices, refreshed on demand
+    @Published var availableDevices: [AudioDevice] = []
+
+    init() {
+        self.preferredDeviceUID = UserDefaults.standard.string(forKey: "preferredInputDeviceUID")
+    }
+
+    /// Refresh the list of available input devices
+    func refreshDevices() {
+        availableDevices = AudioProcessor.getAudioDevices()
+    }
+
+    /// Resolve the preferred device UID to a runtime AudioDeviceID
+    func resolvedDeviceID() -> AudioDeviceID? {
+        guard let uid = preferredDeviceUID else {
+            return resolveInputDevice(preferred: nil)
+        }
+        if let deviceID = getDeviceID(forUID: uid) {
+            return resolveInputDevice(preferred: deviceID)
+        }
+        return resolveInputDevice(preferred: nil)
     }
 }
 
@@ -595,21 +717,42 @@ struct HotkeyRecorderView: View {
 struct SettingsView: View {
     @EnvironmentObject var state: SpeekState
     @ObservedObject var hotkeySettings = HotkeySettings.shared
+    @ObservedObject var inputDeviceSettings = InputDeviceSettings.shared
 
     var body: some View {
         Form {
-            Section("Keyboard Shortcut") {
-                HotkeyRecorderView(hotkeySettings: hotkeySettings)
-
-                Text("Click the button and press your desired key combination")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Button("Reset to Default (⌘⇧A)") {
-                    hotkeySettings.reset()
+            Section("Microphone") {
+                Picker("Input device:", selection: $inputDeviceSettings.preferredDeviceUID) {
+                    Text("System Default").tag(nil as String?)
+                    ForEach(inputDeviceSettings.availableDevices) { device in
+                        Text(device.name).tag(getDeviceUID(for: device.id) as String?)
+                    }
                 }
-                .buttonStyle(.borderless)
-                .foregroundColor(.accentColor)
+            }
+
+            Section("Activation") {
+                Picker("Activation mode:", selection: $hotkeySettings.activationMode) {
+                    Text("Toggle (keyboard shortcut)").tag(ActivationMode.toggle)
+                    Text("Press and hold Fn key").tag(ActivationMode.pressAndHold)
+                }
+
+                if hotkeySettings.activationMode == .toggle {
+                    HotkeyRecorderView(hotkeySettings: hotkeySettings)
+
+                    Text("Click the button and press your desired key combination")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Button("Reset to Default") {
+                        hotkeySettings.reset()
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(.accentColor)
+                } else {
+                    Text("Hold the Fn key to record, release to stop.\nYou may need to set \"Press Fn key to\" → \"Do Nothing\" in System Settings → Keyboard.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
 
             Section("Model") {
@@ -636,7 +779,10 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 350, height: 300)
+        .frame(width: 350, height: 380)
+        .onAppear {
+            inputDeviceSettings.refreshDevices()
+        }
     }
 }
 
