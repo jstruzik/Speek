@@ -76,6 +76,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             }
         }
 
+        // Observe system sleep/wake to avoid audio engine crashes
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+
         // Setup menu bar
         setupMenuBar()
 
@@ -396,6 +401,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func hideOverlay() {
         overlayWindow?.orderOut(nil)
+    }
+
+    // MARK: - System Sleep/Wake
+
+    @objc func systemWillSleep(_ notification: Notification) {
+        logger.info("System going to sleep — stopping audio")
+        // Stop any active streaming before the audio hardware goes away
+        if speekState.isStreaming {
+            stopStreaming()
+        }
+        // Invalidate the cached audio engine — it won't survive sleep
+        transcriber?.getAudioProcessor().invalidateEngine()
+    }
+
+    @objc func systemDidWake(_ notification: Notification) {
+        logger.info("System woke up — audio engine will be recreated on next use")
+        // Engine was already invalidated on sleep. The next startStreaming()
+        // call will create a fresh engine with current hardware state.
+        // Re-warm the engine so the first post-wake recording is fast.
+        let warmUpDeviceID = InputDeviceSettings.shared.resolvedDeviceID()
+        transcriber?.getAudioProcessor().warmUp(inputDeviceID: warmUpDeviceID)
     }
 
     // MARK: - Streaming

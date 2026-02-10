@@ -42,6 +42,8 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         self.wrapped = processor
     }
 
+
+
     // MARK: - AudioProcessing protocol properties
 
     var audioSamples: ContiguousArray<Float> { _audioSamples }
@@ -79,6 +81,21 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         }
     }
 
+    /// Invalidate the cached audio engine, forcing a fresh one on next use.
+    /// Call this when system events (sleep/wake, device changes) may have
+    /// left the engine in an invalid state.
+    func invalidateEngine() {
+        if let oldEngine = audioEngine {
+            oldEngine.inputNode.removeTap(onBus: 0)
+            oldEngine.stop()
+        }
+        audioEngine = nil
+        audioConverter = nil
+        tapFormat = nil
+        lastConfiguredDeviceID = nil
+        logger.info("Audio engine invalidated")
+    }
+
     /// Create (or reuse) the AVAudioEngine for the given input device.
     /// The engine is prepared and started, but no tap is installed yet.
     private func ensureEngine(inputDeviceID: AudioDeviceID?) throws {
@@ -88,12 +105,7 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         }
 
         // Tear down old engine if device changed
-        if let oldEngine = audioEngine {
-            oldEngine.inputNode.removeTap(onBus: 0)
-            oldEngine.stop()
-            audioEngine = nil
-            audioConverter = nil
-        }
+        invalidateEngine()
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
@@ -106,6 +118,13 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         // Get the hardware format from the input node
         let hardwareSampleRate = inputNode.inputFormat(forBus: 0).sampleRate
         let inputFormat = inputNode.outputFormat(forBus: 0)
+
+        // Validate format — another app using the device can cause 0 sample rate
+        guard hardwareSampleRate > 0 && inputFormat.channelCount > 0 else {
+            throw AudioProcessorError.formatCreationFailed(
+                "invalid hardware format (sampleRate: \(hardwareSampleRate), channels: \(inputFormat.channelCount)) — another app may be using the microphone exclusively"
+            )
+        }
 
         guard let nodeFormat = AVAudioFormat(
             commonFormat: inputFormat.commonFormat,
@@ -174,9 +193,12 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         }
     }
 
-    /// Remove the tap from the input node.
+    /// Remove the tap from the input node (safe to call even if no tap is installed).
     private func removeTap() {
-        audioEngine?.inputNode.removeTap(onBus: 0)
+        guard let engine = audioEngine else { return }
+        // removeTap is safe to call even if no tap exists on modern macOS,
+        // but we guard the engine reference to avoid accessing a deallocated object.
+        engine.inputNode.removeTap(onBus: 0)
     }
 
     // MARK: - Buffer processing
@@ -225,13 +247,28 @@ class DeviceAwareAudioProcessor: AudioProcessing {
         _audioEnergy = []
         audioBufferCallback = callback
 
-        // Ensure engine exists and is started (reuses if same device)
-        try ensureEngine(inputDeviceID: deviceToUse)
+        // Ensure engine exists and is started (reuses if same device).
+        // If that fails (e.g. another app changed the audio configuration),
+        // invalidate and retry once with a fresh engine.
+        do {
+            try ensureEngine(inputDeviceID: deviceToUse)
+        } catch {
+            logger.warning("Engine setup failed, retrying with fresh engine: \(error.localizedDescription)")
+            invalidateEngine()
+            try ensureEngine(inputDeviceID: deviceToUse)
+        }
 
-        // If the engine was stopped from a previous stopRecording(), restart it
+        // If the engine was stopped from a previous stopRecording(), restart it.
+        // Same retry logic: if restart fails, rebuild from scratch.
         if let engine = audioEngine, !engine.isRunning {
-            try engine.start()
-            logger.info("Restarted existing audio engine")
+            do {
+                try engine.start()
+                logger.info("Restarted existing audio engine")
+            } catch {
+                logger.warning("Engine restart failed, rebuilding: \(error.localizedDescription)")
+                invalidateEngine()
+                try ensureEngine(inputDeviceID: deviceToUse)
+            }
         }
 
         // Install tap to begin capturing audio
