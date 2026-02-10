@@ -94,8 +94,6 @@ actor StreamingTranscriber {
         self.audioStreamTranscriber = transcriber
         self.isTranscribing = true
 
-        logger.info("Starting stream transcription with VAD")
-
         // Start the streaming transcription (this captures audio from microphone)
         try await transcriber.startStreamTranscription()
     }

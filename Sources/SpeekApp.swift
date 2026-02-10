@@ -107,6 +107,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 await streamingTranscriber.initialize(whisperKit: whisperKit, audioProcessor: transcriber.getAudioProcessor())
             }
 
+            // Pre-warm the audio engine so the first recording doesn't pause music.
+            // This creates and briefly starts the engine to force Core Audio to set up
+            // hardware routing, then stops it. The engine stays cached for instant restart.
+            let warmUpDeviceID = InputDeviceSettings.shared.resolvedDeviceID()
+            transcriber.getAudioProcessor().warmUp(inputDeviceID: warmUpDeviceID)
+
             // Close progress window after loading
             await MainActor.run {
                 for window in NSApp.windows {
