@@ -13,6 +13,7 @@ actor StreamingTranscriber {
     private var audioStreamTranscriber: AudioStreamTranscriber?
     private var audioProcessor: DeviceAwareAudioProcessor?
     private var isTranscribing = false
+    private var transcriptionTask: Task<Void, Never>?
 
     // Callback sends the full current text
     private var onFullTextChange: ((String) -> Void)?
@@ -94,27 +95,71 @@ actor StreamingTranscriber {
         self.audioStreamTranscriber = transcriber
         self.isTranscribing = true
 
-        // Start the streaming transcription (this captures audio from microphone)
-        try await transcriber.startStreamTranscription()
+        // Launch transcription in a stored task so startStreaming returns immediately.
+        // stopStreaming() awaits this task to ensure the final callback fires.
+        transcriptionTask = Task {
+            do {
+                try await transcriber.startStreamTranscription()
+            } catch {
+                logger.error("Stream transcription error: \(error.localizedDescription)")
+            }
+        }
     }
 
-    /// Stop streaming transcription
+    /// Stop streaming transcription and wait for the final transcription pass to complete.
     func stopStreaming() async {
         guard isTranscribing, let transcriber = audioStreamTranscriber else {
             return
         }
 
         await transcriber.stopStreamTranscription()
+        // Wait for the transcription loop to fully finish, ensuring the final
+        // handleStateChange callback has fired and lastSentText is up to date.
+        await transcriptionTask?.value
+        transcriptionTask = nil
 
         isTranscribing = false
         audioStreamTranscriber = nil
         onFullTextChange = nil
-        lastSentText = ""
     }
 
     /// Get the last transcription text (for pasting on stop)
     func getLastText() -> String {
         return lastSentText
+    }
+
+    /// Clear last text after retrieval
+    func clearLastText() {
+        lastSentText = ""
+    }
+
+    /// Do a one-shot transcription of the full recorded audio buffer.
+    /// This catches any audio that the streaming loop missed (e.g., the last < 1 second).
+    func finalTranscribe() async -> String {
+        guard let whisperKit = whisperKit else { return lastSentText }
+
+        let samples = Array(whisperKit.audioProcessor.audioSamples)
+        guard samples.count > 0 else { return lastSentText }
+
+        let options = DecodingOptions(
+            task: .transcribe,
+            language: "en",
+            skipSpecialTokens: true,
+            withoutTimestamps: true
+        )
+
+        do {
+            let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options)
+            let text = results
+                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? lastSentText : text
+        } catch {
+            logger.error("Final transcription failed: \(error.localizedDescription)")
+            return lastSentText
+        }
     }
 
     /// Filter out WhisperKit special tokens and markers

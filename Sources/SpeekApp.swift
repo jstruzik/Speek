@@ -4,6 +4,7 @@ import CoreAudio
 import os.log
 import AVFoundation
 import WhisperKit
+import ApplicationServices
 
 private let logger = Logger(subsystem: "com.speek.app", category: "main")
 
@@ -45,6 +46,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     // Overlay window for real-time transcription display
     var overlayWindow: NSPanel?
     var overlayTextView: NSTextView?
+
+    // Streaming mode state
+    var streamingAXElement: AXUIElement?
+    var streamingInsertionPoint: Int = 0
+    var streamingPastedLength: Int = 0
+    var streamingUseAX: Bool = true
+    var totalPastedText: String = ""
+    var savedClipboard: String?
+    var lastStreamingUpdateTime: CFAbsoluteTime = 0
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false  // Keep running as menu bar app
@@ -190,7 +200,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             let settingsView = SettingsView()
                 .environmentObject(speekState)
             settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 350, height: 380),
+                contentRect: NSRect(x: 0, y: 0, width: 350, height: 500),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
@@ -338,53 +348,187 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // MARK: - Overlay Window
 
+    /// Try to get the screen-space position of the text cursor (caret) in the focused element.
+    /// Uses the AX parameterized attribute kAXBoundsForRangeParameterizedAttribute which returns
+    /// the bounding rect for a given text range — we pass the zero-length selection (insertion point).
+    /// Returns a rect in AppKit coordinates (bottom-left origin), or nil if not available.
+    func getCaretPosition() -> NSRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+
+        var focusedApp: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success else {
+            return nil
+        }
+
+        var focusedElement: AnyObject?
+        guard AXUIElementCopyAttributeValue(focusedApp as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
+            return nil
+        }
+
+        let element = focusedElement as! AXUIElement
+
+        // Get the selected text range (the insertion point is a zero-length range)
+        var selectedRange: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectedRange) == .success else {
+            return nil
+        }
+
+        // Ask for the bounds of that range — this gives us the caret's screen position
+        var boundsValue: AnyObject?
+        guard AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString, selectedRange!, &boundsValue) == .success else {
+            return nil
+        }
+
+        var bounds = CGRect.zero
+        guard AXValueGetValue(boundsValue as! AXValue, .cgRect, &bounds) else {
+            return nil
+        }
+
+        // AX uses top-left origin; convert to AppKit's bottom-left origin
+        guard let screen = NSScreen.screens.first else { return nil }
+        let screenHeight = screen.frame.height
+        let flippedY = screenHeight - bounds.origin.y - bounds.size.height
+        return NSRect(x: bounds.origin.x, y: flippedY, width: bounds.size.width, height: bounds.size.height)
+    }
+
+    /// Get the frame of the frontmost window from the focused application via AX API.
+    func getActiveWindowFrame() -> NSRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+
+        var focusedApp: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success else {
+            return nil
+        }
+
+        var focusedWindow: AnyObject?
+        guard AXUIElementCopyAttributeValue(focusedApp as! AXUIElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success else {
+            return nil
+        }
+
+        let windowElement = focusedWindow as! AXUIElement
+
+        // Get position
+        var positionValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(windowElement, kAXPositionAttribute as CFString, &positionValue) == .success else {
+            return nil
+        }
+        var position = CGPoint.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position) else {
+            return nil
+        }
+
+        // Get size
+        var sizeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(windowElement, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+            return nil
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+            return nil
+        }
+
+        // AX uses top-left origin; convert to AppKit's bottom-left origin
+        if let screen = NSScreen.screens.first {
+            let screenHeight = screen.frame.height
+            let flippedY = screenHeight - position.y - size.height
+            return NSRect(x: position.x, y: flippedY, width: size.width, height: size.height)
+        }
+
+        return nil
+    }
+
     func showOverlay() {
+        let overlayWidth: CGFloat = 420
+        let overlayHeight: CGFloat = 56
+
         if overlayWindow == nil {
-            // Create a floating panel that doesn't activate (steal focus)
+            // Borderless, non-activating floating panel
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 500, height: 80),
-                styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .hudWindow],
+                contentRect: NSRect(x: 0, y: 0, width: overlayWidth, height: overlayHeight),
+                styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
                 defer: false
             )
-            panel.title = "Speek"
             panel.level = .floating
             panel.isFloatingPanel = true
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = true
             panel.hidesOnDeactivate = false
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-            // Create a scroll view with text view for the transcription
-            let scrollView = NSScrollView(frame: panel.contentView!.bounds)
-            scrollView.autoresizingMask = [.width, .height]
-            scrollView.hasVerticalScroller = true
-            scrollView.borderType = .noBorder
+            // Semi-transparent background you can see through
+            let backgroundView = NSView(frame: NSRect(x: 0, y: 0, width: overlayWidth, height: overlayHeight))
+            backgroundView.wantsLayer = true
+            backgroundView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.35).cgColor
+            backgroundView.layer?.cornerRadius = 14
+            backgroundView.layer?.masksToBounds = true
+            backgroundView.autoresizingMask = [.width, .height]
 
-            let textView = NSTextView(frame: scrollView.bounds)
+            // Recording indicator (red dot)
+            let dotSize: CGFloat = 10
+            let dotView = NSView(frame: NSRect(x: 14, y: (overlayHeight - dotSize) / 2, width: dotSize, height: dotSize))
+            dotView.wantsLayer = true
+            dotView.layer?.backgroundColor = NSColor.systemRed.cgColor
+            dotView.layer?.cornerRadius = dotSize / 2
+
+            // Text view for the transcription
+            let textView = NSTextView(frame: NSRect(x: 32, y: 4, width: overlayWidth - 44, height: overlayHeight - 8))
             textView.isEditable = false
-            textView.isSelectable = true
-            textView.backgroundColor = .clear
-            textView.font = NSFont.systemFont(ofSize: 16)
-            textView.textColor = .labelColor
-            textView.textContainerInset = NSSize(width: 12, height: 8)
-            textView.autoresizingMask = [.width, .height]
+            textView.isSelectable = false
+            textView.drawsBackground = false
+            textView.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+            textView.textColor = .white.withAlphaComponent(0.95)
+            textView.textContainerInset = NSSize(width: 4, height: 8)
             textView.string = "Listening..."
 
-            scrollView.documentView = textView
-            panel.contentView = scrollView
+            backgroundView.addSubview(dotView)
+            backgroundView.addSubview(textView)
+            panel.contentView = backgroundView
 
             self.overlayWindow = panel
             self.overlayTextView = textView
         }
 
-        // Position near top-center of main screen
-        if let screen = NSScreen.main {
+        // Position priority:
+        // 1. Just above the text cursor (caret) if detectable
+        // 2. Centered in the active window
+        // 3. Centered on screen
+        var overlayX: CGFloat
+        var overlayY: CGFloat
+        let gap: CGFloat = 36  // space between overlay and cursor
+
+        if let caretRect = getCaretPosition() {
+            // Place centered horizontally on the caret, above it.
+            // caretRect.maxY is the top of the caret in AppKit coords (bottom-left origin),
+            // so placing at maxY + gap puts the overlay above the caret line.
+            overlayX = caretRect.midX - overlayWidth / 2
+            overlayY = caretRect.maxY + gap
+
+            // Clamp to screen bounds
+            if let screen = NSScreen.main {
+                let screenFrame = screen.visibleFrame
+                overlayX = max(screenFrame.minX, min(overlayX, screenFrame.maxX - overlayWidth))
+                // If overlay would go above the screen top, put it below the caret instead
+                if overlayY + overlayHeight > screenFrame.maxY {
+                    overlayY = caretRect.minY - overlayHeight - gap
+                }
+            }
+
+            logger.debug("Overlay positioned near caret at (\(caretRect.origin.x), \(caretRect.origin.y))")
+        } else if let windowFrame = getActiveWindowFrame() {
+            overlayX = windowFrame.midX - overlayWidth / 2
+            overlayY = windowFrame.origin.y + windowFrame.height * 0.25 - overlayHeight / 2
+        } else if let screen = NSScreen.main {
             let screenFrame = screen.visibleFrame
-            let panelWidth: CGFloat = 500
-            let panelHeight: CGFloat = 80
-            let x = screenFrame.midX - panelWidth / 2
-            let y = screenFrame.maxY - panelHeight - 20
-            overlayWindow?.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
+            overlayX = screenFrame.midX - overlayWidth / 2
+            overlayY = screenFrame.midY - overlayHeight / 2
+        } else {
+            overlayX = 400
+            overlayY = 400
         }
+
+        overlayWindow?.setFrame(NSRect(x: overlayX, y: overlayY, width: overlayWidth, height: overlayHeight), display: true)
 
         overlayTextView?.string = "Listening..."
         overlayWindow?.orderFront(nil)
@@ -437,10 +581,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             return
         }
 
+        let mode = HotkeySettings.shared.transcriptionMode
+
         speekState.isStreaming = true
         speekState.streamedText = ""
         updateMenuBarIcon(streaming: true)
         updateMenu()
+
+        // Streaming mode: capture the focused text element BEFORE showing the overlay
+        if mode == .streaming {
+            streamingAXElement = getFocusedTextElement()
+            streamingInsertionPoint = getInsertionPoint(from: streamingAXElement) ?? 0
+            streamingPastedLength = 0
+            streamingUseAX = true
+            totalPastedText = ""
+            savedClipboard = NSPasteboard.general.string(forType: .string)
+            lastStreamingUpdateTime = 0
+        }
 
         // Show the floating overlay
         showOverlay()
@@ -454,6 +611,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                     DispatchQueue.main.async {
                         self?.speekState.streamedText = fullText
                         self?.updateOverlayText(fullText)
+
+                        // In streaming mode, type text into the focused app in real-time
+                        if mode == .streaming {
+                            self?.onStreamingTextUpdate(fullText)
+                        }
                     }
                 }
             } catch {
@@ -470,21 +632,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func stopStreaming() {
+        let mode = HotkeySettings.shared.transcriptionMode
+
         speekState.isStreaming = false
         updateMenuBarIcon(streaming: false)
 
         Task {
-            // Get the final transcribed text before stopping
-            let finalText = await streamingTranscriber.getLastText()
+            // Stop transcription and wait for the transcription loop to fully finish
             await streamingTranscriber.stopStreaming()
+
+            // Do a one-shot transcription of the full audio buffer to catch any
+            // audio that the streaming loop missed (the last < 1 second)
+            let finalText = await streamingTranscriber.finalTranscribe()
+            await streamingTranscriber.clearLastText()
 
             await MainActor.run {
                 self.hideOverlay()
                 self.updateMenu()
 
-                // Paste the final text into the focused app
-                if !finalText.isEmpty {
-                    self.pasteText(finalText)
+                if mode == .streaming {
+                    // Do one final update with the complete text
+                    if !finalText.isEmpty {
+                        self.onStreamingTextUpdate(finalText, force: true)
+                    }
+                    // Restore the original clipboard
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    if let saved = self.savedClipboard {
+                        pasteboard.setString(saved, forType: .string)
+                    }
+                    self.savedClipboard = nil
+                    self.streamingAXElement = nil
+                    self.streamingPastedLength = 0
+                    self.totalPastedText = ""
+                } else {
+                    // Transcribe mode: paste the final text
+                    if !finalText.isEmpty {
+                        self.pasteText(finalText)
+                    }
                 }
             }
         }
@@ -515,6 +700,136 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if let previous = previousContents {
             pasteboard.setString(previous, forType: .string)
         }
+    }
+
+    // MARK: - Streaming Mode (Text Insertion)
+
+    /// Get the focused text element from the frontmost application.
+    func getFocusedTextElement() -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+
+        var focusedApp: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success else {
+            return nil
+        }
+
+        var focusedElement: AnyObject?
+        guard AXUIElementCopyAttributeValue(focusedApp as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
+            return nil
+        }
+
+        return (focusedElement as! AXUIElement)
+    }
+
+    /// Get the current cursor position (UTF-16 offset) from an AX text element.
+    func getInsertionPoint(from element: AXUIElement?) -> Int? {
+        guard let element = element else { return nil }
+
+        var rangeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success else {
+            return nil
+        }
+
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &range) else {
+            return nil
+        }
+
+        return range.location
+    }
+
+    /// Replace text at a given range in the focused AX element (atomic, no keystrokes needed).
+    func replaceTextInElement(_ element: AXUIElement, location: Int, length: Int, with text: String) -> Bool {
+        var range = CFRange(location: location, length: length)
+        guard let axRange = AXValueCreate(.cfRange, &range) else { return false }
+
+        guard AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange) == .success else {
+            return false
+        }
+
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
+    }
+
+    /// Called on each WhisperKit callback in streaming mode.
+    /// Tries the Accessibility API first (atomic text replacement). If AX fails on the
+    /// first attempt, falls back to CGEvent backspaces + clipboard paste for the rest
+    /// of the session.
+    func onStreamingTextUpdate(_ targetText: String, force: Bool = false) {
+        // Throttle to prevent clipboard race conditions: each update must fully
+        // complete (including usleep) before the next fires. 500ms gives the target
+        // app plenty of time to process events between updates.
+        let now = CFAbsoluteTimeGetCurrent()
+        if !force && now - lastStreamingUpdateTime < 0.5 {
+            return
+        }
+        lastStreamingUpdateTime = now
+
+        // Try the Accessibility API first (works in TextEdit, Notes, etc.)
+        if streamingUseAX, let element = streamingAXElement {
+            if replaceTextInElement(element, location: streamingInsertionPoint, length: streamingPastedLength, with: targetText) {
+                streamingPastedLength = (targetText as NSString).length
+                totalPastedText = targetText
+                return
+            }
+            // AX write not supported by this app — switch to CGEvent fallback
+            logger.info("AX text replacement not supported, falling back to CGEvent approach")
+            streamingUseAX = false
+        }
+
+        // CGEvent fallback: diff-based backspace + clipboard paste
+        let oldText = totalPastedText
+        let commonLength = zip(oldText, targetText).prefix(while: { $0 == $1 }).count
+        let deleteCount = oldText.count - commonLength
+        let newSuffix = String(targetText.dropFirst(commonLength))
+
+        if deleteCount > 0 {
+            typeBackspaces(count: deleteCount)
+        }
+
+        if !newSuffix.isEmpty {
+            clipboardPaste(newSuffix)
+        }
+
+        totalPastedText = targetText
+    }
+
+    /// Send N backspace key-down/key-up CGEvents with a delay scaled to the count.
+    func typeBackspaces(count: Int) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let backspaceKeyCode: CGKeyCode = 51
+
+        for _ in 0..<count {
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: true)
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: false)
+            keyDown?.post(tap: .cghidEventTap)
+            keyUp?.post(tap: .cghidEventTap)
+        }
+
+        // Wait for the target app to process all backspaces.
+        // Events are ordered in the HID queue, but the app needs time to handle each one.
+        if count > 0 {
+            usleep(UInt32(count) * 3000 + 50000)
+        }
+    }
+
+    /// Put text on the clipboard and synthesize Cmd+V to paste it.
+    func clipboardPaste(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        let vKeyCode: CGKeyCode = 9
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
+        keyDown?.flags = .maskCommand
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
+
+        // Wait for the target app to process the paste before returning.
+        // This prevents the next callback from overwriting the clipboard.
+        usleep(100000)
     }
 
     func updateMenuBarIcon(streaming: Bool) {
@@ -557,6 +872,12 @@ enum ActivationMode: String, CaseIterable {
     case pressAndHold = "pressAndHold"
 }
 
+// MARK: - Transcription Mode
+enum TranscriptionMode: String, CaseIterable {
+    case transcribe = "transcribe"
+    case streaming = "streaming"
+}
+
 // MARK: - Hotkey Settings
 class HotkeySettings: ObservableObject {
     static let shared = HotkeySettings()
@@ -569,6 +890,12 @@ class HotkeySettings: ObservableObject {
         didSet {
             UserDefaults.standard.set(activationMode.rawValue, forKey: "activationMode")
             NotificationCenter.default.post(name: NSNotification.Name("HotkeyDidChange"), object: nil)
+        }
+    }
+
+    @Published var transcriptionMode: TranscriptionMode {
+        didSet {
+            UserDefaults.standard.set(transcriptionMode.rawValue, forKey: "transcriptionMode")
         }
     }
 
@@ -591,6 +918,13 @@ class HotkeySettings: ObservableObject {
             self.activationMode = mode
         } else {
             self.activationMode = .toggle
+        }
+
+        if let tmString = UserDefaults.standard.string(forKey: "transcriptionMode"),
+           let tm = TranscriptionMode(rawValue: tmString) {
+            self.transcriptionMode = tm
+        } else {
+            self.transcriptionMode = .transcribe
         }
 
         if UserDefaults.standard.object(forKey: "hotkeyKeyCode") != nil {
@@ -762,6 +1096,23 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Transcription Mode") {
+                Picker("Mode:", selection: $hotkeySettings.transcriptionMode) {
+                    Text("Transcribe (paste when done)").tag(TranscriptionMode.transcribe)
+                    Text("Streaming (type as you speak)").tag(TranscriptionMode.streaming)
+                }
+
+                if hotkeySettings.transcriptionMode == .streaming {
+                    Text("Text is typed into the focused app in real-time as you speak. Corrections are applied automatically.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Text is transcribed and pasted into the focused app when you stop recording.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             Section("Activation") {
                 Picker("Activation mode:", selection: $hotkeySettings.activationMode) {
                     Text("Toggle (keyboard shortcut)").tag(ActivationMode.toggle)
@@ -811,7 +1162,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 350, height: 380)
+        .frame(width: 350, height: 500)
         .onAppear {
             inputDeviceSettings.refreshDevices()
         }
