@@ -26,11 +26,12 @@ https://github.com/user-attachments/assets/06180615-f644-4879-be17-d08a26f095a1
 ## Features
 
 - **Real-time transcription** — text appears as you speak with live corrections
+- **Floating overlay** — see your transcription in a live overlay, text is pasted when you stop recording
 - **Voice Activity Detection** — only transcribes when you're speaking, ignores silence
 - **Menu bar app** — runs quietly in your menu bar, always one click away
-- **Global hotkey** — toggle with `Cmd+Shift+A` from anywhere (configurable)
+- **Global hotkey** — toggle with `Cmd+Shift+A` or hold Fn key (configurable)
+- **Microphone selection** — choose your preferred input device in Settings
 - **100% local** — all processing on-device via [WhisperKit](https://github.com/argmaxinc/WhisperKit), nothing sent to the cloud
-- **Auto-corrections** — diff-based typing automatically fixes text as the model refines output
 
 ## Download
 
@@ -43,10 +44,10 @@ Grab the latest **Speek.dmg** or **Speek.app.zip** from the [Releases page](../.
 1. **Open Speek** — it appears as a microphone icon in your menu bar
 2. **Grant permissions** when prompted:
    - **Microphone** — for audio capture
-   - **Accessibility** — for typing text into other applications (System Settings → Privacy & Security → Accessibility)
-3. **Press `Cmd+Shift+A`** (or click the menu bar icon) to start transcribing
-4. **Speak** — your words are typed in real-time into the focused app
-5. **Press `Cmd+Shift+A` again** to stop
+   - **Accessibility** — for pasting text into other applications (System Settings → Privacy & Security → Accessibility)
+3. **Press `Cmd+Shift+A`** (or hold Fn) to start transcribing
+4. **Speak** — a floating overlay shows your transcription in real-time
+5. **Press `Cmd+Shift+A` again** (or release Fn) to stop — the transcribed text is pasted into the focused app
 
 On first launch, Speek downloads the Whisper `base.en` model (~50MB). This is a one-time download stored in `~/Library/Application Support/Speek/Models/`.
 
@@ -59,9 +60,20 @@ cd Speek
 
 **Option A — Xcode:**
 
-Open `Speek.xcodeproj`, select your development team under Signing & Capabilities, and hit `Cmd+R`.
+Open `Speek.xcodeproj` and hit `Cmd+R` to build and run. No signing configuration is needed for local development (the project uses ad-hoc signing by default).
 
-**Option B — Command line:**
+**Option B — Makefile (recommended for install):**
+
+```bash
+make build      # Build the Release configuration
+make install    # Build and copy Speek.app to /Applications
+make clean      # Remove build artifacts
+make uninstall  # Remove from /Applications
+```
+
+> **Note:** `make install` automatically resets the Accessibility permission for Speek, since each rebuild produces a new ad-hoc code signature. You will be prompted to re-grant Accessibility permission on the next launch.
+
+**Option C — Swift Package Manager:**
 
 ```bash
 swift build -c release
@@ -77,7 +89,7 @@ swift build -c release
 
 ## How It Works
 
-Speek uses WhisperKit's `AudioStreamTranscriber` with Voice Activity Detection to capture and transcribe speech in real-time. A diff-based approach handles corrections — if the model revises earlier text, Speek backspaces and retypes the corrected portion so the final output is always accurate.
+Speek uses WhisperKit's `AudioStreamTranscriber` with Voice Activity Detection to capture and transcribe speech in real-time. During recording, a floating overlay displays the live transcription. When recording stops, the final text is pasted into the focused application via the clipboard.
 
 ## License
 

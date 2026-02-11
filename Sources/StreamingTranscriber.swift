@@ -1,46 +1,44 @@
 import Foundation
 import WhisperKit
+import CoreAudio
 import os.log
 
 private let logger = Logger(subsystem: "com.speek.app", category: "streaming")
 
 /// Wrapper around WhisperKit's AudioStreamTranscriber for VAD-based streaming transcription.
-/// Types text in realtime and uses backspaces to correct when WhisperKit revises.
+/// Sends full transcription text to a callback on each update; SpeekApp displays it in an overlay
+/// and pastes the final result when recording stops.
 actor StreamingTranscriber {
     private var whisperKit: WhisperKit?
     private var audioStreamTranscriber: AudioStreamTranscriber?
+    private var audioProcessor: DeviceAwareAudioProcessor?
     private var isTranscribing = false
+    private var transcriptionTask: Task<Void, Never>?
 
-    // Callback sends the full current text - SpeekApp handles diff calculation
-    // This avoids race conditions between what we think is typed vs what actually is
+    // Callback sends the full current text
     private var onFullTextChange: ((String) -> Void)?
 
     // Track last sent text to avoid duplicate callbacks
     private var lastSentText = ""
 
-    // Rolling window: text that's been locked in and won't be revised
-    private var lockedText = ""
-    private var lockedSegmentCount = 0
-    private var lastTextChangeTime = Date()
-
     // Configuration
-    private let silenceThreshold: Float = 0.2  // Lower = more sensitive to voice
-    private let requiredSegmentsForConfirmation: Int = 2  // Higher = better word boundaries, more latency
-    private let segmentsToKeepRevisable: Int = 3  // Keep last N confirmed segments revisable
-    private let silenceLockDelay: TimeInterval = 2.0  // Lock all segments after N seconds of no changes
+    private let silenceThreshold: Float = 0.2
+    private let requiredSegmentsForConfirmation: Int = 2
 
     init() {}
 
     /// Initialize with a pre-loaded WhisperKit instance
-    func initialize(whisperKit: WhisperKit) async {
+    func initialize(whisperKit: WhisperKit, audioProcessor: DeviceAwareAudioProcessor) async {
         self.whisperKit = whisperKit
+        self.audioProcessor = audioProcessor
         logger.info("StreamingTranscriber initialized with WhisperKit")
     }
 
     /// Start streaming transcription with VAD
-    /// - Parameter onFullText: Callback invoked with the full current transcription text
-    ///   SpeekApp will handle diffing against what's actually been typed
-    func startStreaming(onFullText: @escaping (String) -> Void) async throws {
+    /// - Parameters:
+    ///   - inputDeviceID: The audio input device to use, or nil for default
+    ///   - onFullText: Callback invoked with the full current transcription text
+    func startStreaming(inputDeviceID: AudioDeviceID? = nil, onFullText: @escaping (String) -> Void) async throws {
         guard let whisperKit = whisperKit else {
             throw StreamingError.notInitialized
         }
@@ -55,9 +53,6 @@ actor StreamingTranscriber {
 
         // Reset state
         lastSentText = ""
-        lockedText = ""
-        lockedSegmentCount = 0
-        lastTextChangeTime = Date()
 
         // Get tokenizer (already loaded by WhisperKit)
         guard let tokenizer = whisperKit.tokenizer else {
@@ -73,6 +68,9 @@ actor StreamingTranscriber {
             withoutTimestamps: false,
             wordTimestamps: true
         )
+
+        // Set preferred input device before creating the stream transcriber
+        audioProcessor?.preferredInputDeviceID = inputDeviceID
 
         // Create AudioStreamTranscriber with VAD enabled
         let transcriber = AudioStreamTranscriber(
@@ -97,27 +95,71 @@ actor StreamingTranscriber {
         self.audioStreamTranscriber = transcriber
         self.isTranscribing = true
 
-        logger.info("Starting stream transcription with VAD (threshold: \(self.silenceThreshold))")
-
-        // Start the streaming transcription (this captures audio from microphone)
-        try await transcriber.startStreamTranscription()
+        // Launch transcription in a stored task so startStreaming returns immediately.
+        // stopStreaming() awaits this task to ensure the final callback fires.
+        transcriptionTask = Task {
+            do {
+                try await transcriber.startStreamTranscription()
+            } catch {
+                logger.error("Stream transcription error: \(error.localizedDescription)")
+            }
+        }
     }
 
-    /// Stop streaming transcription
+    /// Stop streaming transcription and wait for the final transcription pass to complete.
     func stopStreaming() async {
         guard isTranscribing, let transcriber = audioStreamTranscriber else {
             return
         }
 
-        logger.info("Stopping stream transcription")
         await transcriber.stopStreamTranscription()
+        // Wait for the transcription loop to fully finish, ensuring the final
+        // handleStateChange callback has fired and lastSentText is up to date.
+        await transcriptionTask?.value
+        transcriptionTask = nil
 
         isTranscribing = false
         audioStreamTranscriber = nil
         onFullTextChange = nil
+    }
+
+    /// Get the last transcription text (for pasting on stop)
+    func getLastText() -> String {
+        return lastSentText
+    }
+
+    /// Clear last text after retrieval
+    func clearLastText() {
         lastSentText = ""
-        lockedText = ""
-        lockedSegmentCount = 0
+    }
+
+    /// Do a one-shot transcription of the full recorded audio buffer.
+    /// This catches any audio that the streaming loop missed (e.g., the last < 1 second).
+    func finalTranscribe() async -> String {
+        guard let whisperKit = whisperKit else { return lastSentText }
+
+        let samples = Array(whisperKit.audioProcessor.audioSamples)
+        guard samples.count > 0 else { return lastSentText }
+
+        let options = DecodingOptions(
+            task: .transcribe,
+            language: "en",
+            skipSpecialTokens: true,
+            withoutTimestamps: true
+        )
+
+        do {
+            let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options)
+            let text = results
+                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? lastSentText : text
+        } catch {
+            logger.error("Final transcription failed: \(error.localizedDescription)")
+            return lastSentText
+        }
     }
 
     /// Filter out WhisperKit special tokens and markers
@@ -125,25 +167,19 @@ actor StreamingTranscriber {
         var filtered = text
         // Remove common WhisperKit special markers and non-speech sounds
         let specialPatterns = [
-            // Blank audio markers (various formats)
             "\\[\\[BLANK_AUDIO\\]\\]",
             "\\[BLANK_AUDIO\\]",
             "\\(blank audio\\)",
             "BLANK_AUDIO",
             "BLANK AUDIO",
             "\\bBLANK\\b",
-            // Speech quality markers (various spacing formats)
             "\\[\\s*inaudible\\s*\\]",
             "\\[\\s*silence\\s*\\]",
             "\\[\\s*unintelligible\\s*\\]",
             "\\(\\s*silence\\s*\\)",
-            // Non-speech sounds in brackets [clicking], [typing], [music], etc.
             "\\[[^\\]]*(?:click|type|typing|keyboard|music|applause|laughter|cough|sneeze|noise|sound|static|background|breathing)s?[^\\]]*\\]",
-            // Non-speech sounds in asterisks *clicking*, *typing*, etc.
             "\\*[^*]*(?:click|type|typing|keyboard|cough|sneeze|sigh|laugh|noise|sound|breathing)s?[^*]*\\*",
-            // Non-speech sounds in parentheses (clicking), (typing), etc.
             "\\([^)]*(?:click|type|typing|keyboard|cough|sneeze|sigh|laugh|noise|sound|breathing)s?[^)]*\\)",
-            // Whisper hallucinations
             "thank(?:s| you) for (?:watching|listening)",
             "(?:please )?(?:like and )?subscribe",
             "see you (?:next time|in the next)"
@@ -162,10 +198,8 @@ actor StreamingTranscriber {
         filtered = filtered.trimmingCharacters(in: .whitespaces)
 
         // Filter out text that's just punctuation or non-word sounds
-        // (keyboard clicks often transcribe as ".", "..", "tick", "tock", single letters)
         let stripped = filtered.lowercased().filter { $0.isLetter }
 
-        // Allow common short words, filter everything else under 2 letters
         let validShortWords = Set(["i", "a", "o", "oh", "ah", "ok", "no", "so", "go", "do", "to", "be", "he", "we", "me", "my", "by", "up", "or", "on", "in", "an", "at", "as", "is", "it", "if"])
         if stripped.count < 2 && !validShortWords.contains(stripped) {
             return ""
@@ -178,8 +212,6 @@ actor StreamingTranscriber {
         }
 
         // Fix common word concatenation issues from Whisper
-        // Only split on words unlikely to be suffixes of real English words
-        // e.g., "meanit" -> "mean it", but "exit" stays "exit"
         let safeSplitWords = [
             "seems", "would", "could", "should", "think", "because", "concatenate", "concatenates",
             "actually", "really", "probably", "definitely", "something", "everything", "nothing",
@@ -188,7 +220,6 @@ actor StreamingTranscriber {
         ]
         var result = filtered
         for word in safeSplitWords {
-            // Match word concatenated after a letter (e.g., "itseems" -> "it seems")
             let pattern = "([a-zA-Z])(\(word))\\b"
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                 result = regex.stringByReplacingMatches(
@@ -203,101 +234,35 @@ actor StreamingTranscriber {
     }
 
     /// Handle state changes from AudioStreamTranscriber
+    /// Simply builds full text from all confirmed + unconfirmed segments.
     private func handleStateChange(oldState: AudioStreamTranscriber.State, newState: AudioStreamTranscriber.State) {
-        let confirmedCount = newState.confirmedSegments.count
-        let now = Date()
-
-        // Safety check: WhisperKit can revise and reduce segment count
-        // If our locked count is now invalid, reset it
-        if lockedSegmentCount > confirmedCount {
-            logger.warning("Segment count reduced from \(self.lockedSegmentCount) to \(confirmedCount), resetting lock")
-            lockedSegmentCount = 0
-            // Keep locked text as-is since it's already been typed
-        }
-
-        // Time-based locking: if no text changes for a while, lock all confirmed segments
-        // This prevents corrections after a pause in speech
-        let timeSinceLastChange = now.timeIntervalSince(lastTextChangeTime)
-        if timeSinceLastChange > silenceLockDelay && confirmedCount > lockedSegmentCount {
-            let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<confirmedCount]
-            let newLockedText = newLockedSegments
-                .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
-
-            if !newLockedText.isEmpty {
-                if !lockedText.isEmpty {
-                    lockedText += " "
-                }
-                lockedText += newLockedText
-            }
-            lockedSegmentCount = confirmedCount
-            logger.info("Time-based lock: locked all \(confirmedCount) segments after \(String(format: "%.1f", timeSinceLastChange))s silence")
-        }
-
-        // Lock in older segments that are beyond our revisable window
-        // This prevents revisions to text from long ago
-        if confirmedCount > lockedSegmentCount + segmentsToKeepRevisable {
-            let segmentsToLock = confirmedCount - segmentsToKeepRevisable
-            // Ensure valid range
-            if segmentsToLock > lockedSegmentCount {
-                let newLockedSegments = newState.confirmedSegments[lockedSegmentCount..<segmentsToLock]
-                let newLockedText = newLockedSegments
-                    .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: " ")
-
-                if !newLockedText.isEmpty {
-                    if !lockedText.isEmpty {
-                        lockedText += " "
-                    }
-                    lockedText += newLockedText
-                }
-                lockedSegmentCount = segmentsToLock
-                logger.info("Locked \(segmentsToLock) segments, locked text now: '\(self.lockedText.suffix(50))...'")
+        // Build text from all confirmed segments
+        var parts: [String] = []
+        for segment in newState.confirmedSegments {
+            let text = filterSpecialTokens(segment.text.trimmingCharacters(in: .whitespaces))
+            if !text.isEmpty {
+                parts.append(text)
             }
         }
 
-        // Build revisable text from recent confirmed segments + unconfirmed
-        let safeStartIndex = min(lockedSegmentCount, confirmedCount)
-        let revisableSegments = Array(newState.confirmedSegments.suffix(from: safeStartIndex))
-        var revisableText = revisableSegments
-            .map { filterSpecialTokens($0.text.trimmingCharacters(in: .whitespaces)) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-
-        // Include unconfirmed segments for realtime output
+        // Include unconfirmed segments for real-time output
         for segment in newState.unconfirmedSegments {
             let text = filterSpecialTokens(segment.text.trimmingCharacters(in: .whitespaces))
             if !text.isEmpty {
-                if !revisableText.isEmpty {
-                    revisableText += " "
-                }
-                revisableText += text
+                parts.append(text)
             }
         }
 
-        // Combine locked + revisable for full text
-        var currentText = lockedText
-        if !revisableText.isEmpty {
-            if !currentText.isEmpty {
-                currentText += " "
-            }
-            currentText += revisableText
-        }
-        currentText = currentText.trimmingCharacters(in: .whitespaces)
+        let currentText = parts.joined(separator: " ").trimmingCharacters(in: .whitespaces)
 
         // Skip if nothing changed
         guard currentText != lastSentText else {
             return
         }
 
-        // Text changed - update timestamp for time-based locking
-        lastTextChangeTime = now
         lastSentText = currentText
-        logger.info("Current text: '\(currentText)'")
 
-        // Send full text to callback - SpeekApp handles diffing
+        // Send full text to callback
         if let callback = onFullTextChange {
             callback(currentText)
         }
